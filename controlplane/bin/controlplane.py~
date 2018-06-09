@@ -1,0 +1,786 @@
+#!/usr/bin/env python
+import argparse
+import logging
+import os
+import pipes
+import signal
+import six
+import subprocess
+import sys
+import threading
+import time
+import traceback
+
+if six.PY2:
+    import Queue as queue
+else:
+    import queue
+
+from PIL import Image
+
+import gym
+
+import universe
+from universe import pyprofile, twisty, wrappers
+from universe.envs import vnc_env
+from universe.rewarder import remote
+
+import gym_controlplane
+from gym_controlplane import error, utils
+
+gym_controlplane.logger_setup()
+logger = logging.getLogger()
+
+# Needed only in development, where we can run os._exit. In this case,
+# we want to kill any outstanding vexpects.
+manual_subprocess_cleanup = {}
+
+class Exit(Exception):
+    pass
+
+class EnvController(threading.Thread):
+    def __init__(self, env, vnc_address, env_status, agent_conn, error_buffer, control_buffer, no_vexpect, integrator_mode, terminate_on_disconnect=False, idle_timeout=None):
+        super(EnvController, self).__init__(name='EnvController')
+
+        self.env = env
+        self.vnc_address = vnc_address
+        self.env_status = env_status
+        self.agent_conn = agent_conn
+        self.control_buffer = control_buffer
+
+        self.daemon = True
+        self.error_buffer = error_buffer
+
+        self.no_vexpect = no_vexpect
+        self.integrator_mode = integrator_mode
+        self.terminate_on_disconnect = terminate_on_disconnect
+
+        self.cv = threading.Condition()
+
+        self.healthcheck_fail_countdown = 0
+        self._healthcheck_fail_max = 5
+
+        self.idle_timeout = idle_timeout
+        self.last_disconnect_time = time.time()
+        self._idle_message_interval = 10 # for logging
+
+        self.env_launcher = -1
+
+        self.load_env(env_status.env_id)
+        # Run this in main thread
+        self.reset()
+
+    def load_env(self, env_id):
+        if env_id is not None:
+            spec = gym_controlplane.spec(env_id)
+        else:
+            spec = None
+        self.controlplane_spec = spec
+
+        if self.env_status.env_id != env_id or self.env_launcher == -1:
+            # Do this *after* making sure it's a valid env
+            self.env_status.env_id = env_id
+            self.env_launcher = gym_controlplane.env_launcher(
+                spec,
+                integrator_mode=self.integrator_mode,
+            )
+
+    def trigger_reset(self, metadata={}):
+        # metadata is currently unused, but it was originally supplied
+        # to indicate special conditions on how to perform the
+        # reset. for example, if a game is slow to load, maybe you can
+        # click a button saying to reset play rather than reload the
+        # whole page.
+        logger.info('[%s] Triggering a reset on EnvController', utils.thread_name())
+        with self.cv:
+            self.env_status.set_env_info('resetting', metadata=metadata)
+            self.cv.notify()
+
+    def run(self):
+        try:
+            self.do_run()
+        except Exception as e:
+            self.error_buffer.record(e)
+
+    def do_run(self):
+        while True:
+            self.process_control_messages()
+            self.check_if_idle()
+
+            if self.env_launcher is not None:
+                healthy = self.env_launcher.healthcheck()
+            else:
+                healthy = True
+
+            if healthy:
+                self.healthcheck_fail_countdown = 0
+            else:
+                self.healthcheck_fail_countdown += 1
+                logger.info('[%s] Environment failed healthcheck! Count: %s',
+                    utils.thread_name(),
+                    self.healthcheck_fail_countdown)
+
+            if self.healthcheck_fail_countdown > self._healthcheck_fail_max:
+                logger.info('[%s] RESET CAUSE: environment healthcheck failed too many times!', utils.thread_name())
+                self.agent_conn.send_env_reward(0, True, {'reason': 'controlplane.browser_crashed'})
+                # This will reset the environment
+                self.reset()
+
+            with self.cv:
+                self.cv.wait(timeout=1)
+
+            if self.env_status.env_state == 'resetting':
+                logger.info('[%s] controlplane.py is resetting the environment', utils.thread_name())
+                self.reset()
+
+    def process_control_messages(self):
+        while True:
+            try:
+                type, payload = self.control_buffer.get(block=False)
+            except queue.Empty:
+                break
+            else:
+                if type == 'rpc':
+                    context, message = payload
+                    self.process_rpc(context, message)
+                elif type == 'client_disconnect':
+                    conn, stats = payload
+                    self.process_disconnect(conn, stats)
+                else:
+                    assert False, 'Unrecogized type: {}'.format(type)
+
+    def process_disconnect(self, conn, stats):
+        if stats is not None and stats['messages'] > 0:
+            active = self.agent_conn.active_clients()
+            if len(active) > 0:
+                logger.info('[%s] Active client disconnected (sent %d messages), but still have %d active clients left', utils.thread_name(), stats['messages'], len(active))
+            elif self.terminate_on_disconnect:
+                self.error_buffer.record(
+                    Exit('EXIT CAUSE: last active client disconnected (sent {} messages)'.format(stats['messages'])), wrap=False,
+                )
+            else:
+                self.last_disconnect_time = time.time()
+                logger.info('[%s] Last active client disconnected (sent %d messages). Not exiting since terminate_on_disconnect is not set.', utils.thread_name(), stats['messages'])
+
+    def process_rpc(self, context, message):
+        if message['method'] == 'rpc.env.reset':
+            env_id = message['body']['env_id']
+
+            if env_id != self.env_status.env_id:
+                # TODO: dry this up
+                try:
+                    gym_controlplane.spec(env_id)
+                except error.UnregisteredEnv as e:
+                    self.agent_conn.send_rpc_reply_error(
+                        'No server-side registration for env: {} (missing path {})'.format(env_id, e.path),
+                        parent_message_id=message['headers']['message_id'],
+                        parent_context=context
+                    )
+                    pyprofile.incr('control.env_id_change.invalid_env_id')
+                    return
+                else:
+                    # Make sure we're resetting before changing the env_id
+                    self.env_status.set_env_info('resetting', {})
+                    self.load_env(env_id)
+
+                pyprofile.incr('control.env_id_change')
+                pyprofile.incr('control.env_id_change.{}'.format(env_id))
+                logger.info('[%s] RESET CAUSE: changing out environments: %s -> %s', utils.thread_name(), self.env_status.env_id, env_id)
+            else:
+                logger.info('[%s] RESET CAUSE: Resetting environment due to rpc.env.reset, keeping same env_id=%s',
+                            utils.thread_name(), env_id)
+
+            self.reset()
+
+            # Right now we'll send two describe messages: one when the
+            # env comes up, and one in reply to the RPC. We should
+            # just make this into a no-op reply message rather than
+            # reuse the v0.env.describe.
+            self.agent_conn.send_env_describe(
+                self.env_status.env_id,
+                self.env_status.env_state,
+                parent_message_id=message['headers']['message_id'],
+                parent_context=context)
+
+    def check_if_idle(self):
+        if self.idle_timeout is None:
+            return
+
+        active = self.agent_conn.active_clients()
+        if len(active) == 0:
+            now = time.time()
+            idle_duration = now - self.last_disconnect_time
+
+            utils.periodic_log(self, 'idle_for', 'Idle for %.2f seconds', idle_duration,
+                                   frequency=self._idle_message_interval)
+            if self.idle_timeout is not None:
+                utils.periodic_log(self, 'idle_timeout',
+                                       'Environment will exit due to idle timeout after %.0f seconds',
+                                       self.idle_timeout, frequency=self._idle_message_interval)
+            if self.idle_timeout is not None and idle_duration > self.idle_timeout:
+                self.error_buffer.record(
+                    Exit('EXIT CAUSE: idle timeout exceeded after {:.2f} seconds'.format(idle_duration)), wrap=False)
+
+    def reset(self):
+        self.env_status.set_env_info('resetting', {})
+        env_info = self.env_status.env_info()  # This can change from under us, so only want to call env_info once to extract both state and metadata.
+        env_state = env_info['env_state']
+        metadata = env_info['metadata']
+        logger.info('[%s] Env state: env_id=%s metadata=%s', utils.thread_name(), env_info['env_id'], metadata)
+        assert env_state == 'resetting', 'Env state should be resetting, but is instead: {}'.format(env_state)
+        # In the future, may choose to block on the user replying,
+        # which would let us know they won't mess with our
+        # initialization sequence. In practice this hasn't seemed to
+        # be an issue.
+        self.agent_conn.send_env_describe(self.env_status.env_id, env_state)
+
+        # If in demo mode, let the demonstration code know what env is
+        # active
+        write_env_id(self.env_status.env_id)
+
+        for i in range(5):
+            if self.env_launcher is not None:
+                self.env_launcher.reset()
+            status = self._setup()
+            # If need to repeat, will have logged the reason in _setup.
+            if status is None:
+                break
+
+        self.env_status.env_state = 'running'
+        self.agent_conn.send_env_describe(self.env_status.env_id, self.env_status.env_state)
+
+        with self.cv:
+            self.cv.notifyAll()
+
+    def _setup(self):
+        if not self.controlplane_spec:
+            return
+        elif not os.path.exists(self.controlplane_spec.vexpect_path):
+            # TODO: DRY this up
+            logger.info('[%s] Skipping vexpect initialization since no macro present', utils.thread_name())
+            return
+        elif self.no_vexpect:
+            logger.info('[%s] Skipping vexpect initialization as configured', utils.thread_name())
+            return
+        cmd = [os.path.abspath(os.path.join(os.path.dirname(__file__), '../bin/play_vexpect')), '-e', self.controlplane_spec.id, '-r', self.vnc_address, '-d']
+        logger.info('[%s] Running command: %s', utils.thread_name(), utils.pretty_command(cmd))
+        proc = subprocess.Popen(cmd)
+        manual_subprocess_cleanup[proc.pid] = proc
+        proc.communicate()
+        del manual_subprocess_cleanup[proc.pid]
+
+        if proc.returncode == 0:
+            return
+        elif proc.returncode == 10:
+            logger.info('[%s] RESET CAUSE: VExpect failed with returncode 10, which means it timed out internally. Going to trigger a reset.', utils.thread_name())
+            self.trigger_reset()
+            return 'fail'
+        else:
+            raise error.Error('Bad returncode {} from {}'.format(proc.returncode, utils.pretty_command(cmd)))
+
+    def close(self):
+        if self.env_launcher is not None:
+            self.env_launcher.close()
+        self.env_launcher = None
+
+class RewardLogger(object):
+    def __init__(self):
+        self.reset(log=False, episode_stats=True)
+
+    def reset(self, log=True, episode_stats=True):
+        if log:
+            self._log()
+
+        self.last_print = time.time()
+        # Could just maintain summary statistics, but we're not going
+        # to have more than fps rewards at once, so it's fine to just
+        # keep them all around.
+        self.reward = []
+        self.done = False
+        self.info = {}
+        self.count = 0
+
+        if episode_stats:
+            if log:
+                self._log_reset()
+            self.episode_reward = 0
+            self.episode_count = 0
+            self.episode_start = time.time()
+
+    def record(self, reward, done, info):
+        self.reward.append(reward)
+        self.done = self.done or done
+        self.info.update(info)
+        self.count += 1
+
+        self.episode_reward += reward
+        self.episode_count += 1
+
+        if time.time() - self.last_print > 1:
+            self._log()
+            self.reset(log=False, episode_stats=False)
+
+    def _log_reset(self):
+        logger.info('[%s] Ending previous episode: episode_reward=%s episode_count=%s episode_duration=%.2f', utils.thread_name(), self.episode_reward, self.episode_count, time.time() - self.episode_start)
+
+    def _log(self):
+        if 'rewarder.profile' in self.info:
+            self.info['rewarder.profile'] = '<{} bytes>'.format(len(str(self.info['rewarder.profile'])))
+
+        if len(self.reward) > 0:
+            min_reward = min(self.reward)
+            max_reward = max(self.reward)
+        else:
+            min_reward = '(empty)'
+            max_reward = '(empty)'
+
+        logger.info('[%s] Over past %.2fs, sent %s reward messages to agent: reward=%s reward_min=%s reward_max=%s done=%s info=%s',
+                    utils.thread_name(), time.time() - self.last_print, self.count,
+                    sum(self.reward), min_reward, max_reward,
+                    self.done, self.info)
+
+class Rewarder(threading.Thread):
+    def __init__(self, env, vnc_address, agent_conn, env_status, trigger_reset, error_buffer, no_vexpect, no_scorer, fps=60):
+        super(Rewarder, self).__init__(name='Rewarder',)
+        self._has_initial_reward = False
+        self.reward_parser = None
+        self.env = env
+        self.vnc_address = vnc_address
+        self.agent_conn = agent_conn
+
+        # Imported from EnvController
+        self.env_status = env_status
+        self.trigger_reset = trigger_reset
+
+        self.daemon = True
+        self.error_buffer = error_buffer
+        self.no_vexpect = no_vexpect
+        self.no_scorer = no_scorer
+
+        self.controlplane_spec = None
+        self.set_reward_parser(env_status.env_info())
+
+        self.fps = fps
+
+    def set_reward_parser(self, env_info):
+        self.env_id = env_info['env_id']
+        self._state_id = env_info['state_id']
+
+        # If in demo mode, let the demonstration code know what env is
+        # active
+        write_env_id(self.env_id)
+
+        if self.env_id is None:
+            return
+        self.controlplane_spec = gym_controlplane.spec(self.env_id)
+        self.spec = gym.spec(self.env_id)
+
+        # This is quite slow (usually 100-200ms) so just be careful
+        # about calling it too much. We also have some suspicions that
+        # the scorer TF graph may leak memory but haven't needed to
+        # investigate.
+        self.reward_parser = self.controlplane_spec.build_reward_parser(load_vexpect=not self.no_vexpect, load_scorer=not self.no_scorer)
+
+        # All the pixels needed for vexpect/scoring.
+        subscription = self.reward_parser.subscription()
+        if subscription is not None:
+            subscription = [tuple(sub) for sub in subscription]
+
+        metadata_encoding = self.spec.tags.get('metadata_encoding')
+        if metadata_encoding is not None and subscription is not None:
+            if metadata_encoding['type'] == 'qrcode':
+                subscription += [(metadata_encoding['x'], metadata_encoding['width'], metadata_encoding['y'], metadata_encoding['height'])]
+            else:
+                raise error.Error('Unsupported metadata encoding type: {}'.format(metadata_encoding))
+        # Should fix this up and abstract
+        # probe_key = self.spec.tags.get('action_probe')
+        probe_key = 0x60
+
+        logger.info('Using metadata_encoding=%s probe_key=%s subscription=%s', metadata_encoding, probe_key, subscription)
+        # Just subscribe to the parts of the screen we're going to care about
+        self.env.unwrapped.diagnostics.update(
+            metadata_encoding=metadata_encoding,
+            probe_key=probe_key,
+        )
+        self.env.unwrapped.vnc_session.update(
+            name="0", # hack
+            subscription=subscription or [],
+        )
+
+    def run(self):
+        try:
+            self.do_run()
+        except Exception as e:
+            self.error_buffer.record(e)
+
+    def do_run(self):
+        # For debug environments which set a server-enforced time
+        # limit
+        frames = 0
+        # Log all the rewards, but buffer those logs rather than
+        # spewing out in realtime.
+        reward_logger = RewardLogger()
+
+        last_export = time.time()
+        # Just make sure last_export time is set inside of pyprofile
+        pyprofile.export(log=False, reset=False)
+
+        # For tracking the framerate
+        target = time.time()
+        self.__vnc_last_update = target  # real initial value
+        while True:
+            # Atomically recover details of the env state
+            env_info = self.env_status.env_info()
+            env_state = env_info['env_state']
+
+            # Hang out until it's all done resetting. We don't need to
+            # reset any of our internal state here, as that happens
+            # below. (We're not actually guaranteed to actually see a
+            # resetting state, if the reset is very fast.)
+            while env_state == 'resetting':
+                logger.info('[%s] Blocking until env finishes resetting', utils.thread_name())
+                env_info = self.env_status.wait_for_env_state_change(env_state)
+                logger.info('[%s] Unblocking since env reset finished', utils.thread_name())
+                env_state = env_info['env_state']
+
+                # Start our frame timing from here
+                target = time.time()
+
+            env_state = env_info['env_state']
+            metadata = env_info['metadata']
+            state_id = env_info['state_id']
+            env_id = env_info['env_id']
+            assert env_state == 'running', 'Env state: {}'.format(env_state)
+
+            # Detect whether the environment has reset, and thus we
+            # need to clear our internal state.
+            if env_id != self.env_id:
+                assert state_id != self._state_id, 'State ids: {}->{}'.format(state_id, self._state_id)
+                logger.info('[%s] Changing reward_parsers: %s -> %s', utils.thread_name(), self.env_id, env_id)
+                # This is slow (since it has to load the scorer), so
+                # we call it only in the rare case where the env ID
+                # has changed.
+                self.set_reward_parser(env_info)
+                frames = 0
+                reward_logger.reset()
+            elif state_id != self._state_id and self.reward_parser is None:
+                # Just set internal state. This is fast since it
+                # doesn't actually have to load anything. Also only
+                # relevant during development.
+                self.set_reward_parser(env_info)
+                frames = 0
+                reward_logger.reset()
+            elif state_id != self._state_id:
+                # If the env state ID changed, then we need to reset
+                # the reward parser.
+                #
+                # Not enough just to look whether the env_state is
+                # resetting, since in theory we might never see the
+                # resetting state for a very fast reset.
+                logger.info('[%s] Clearing reward_parser state: env_id=%s state_id=%d->%d, env_state=%s', utils.thread_name(), env_id, self._state_id, state_id, env_state)
+                self._state_id = state_id
+                self.reward_parser.reset()
+                frames = 0
+                reward_logger.reset()
+
+            # Recover the exact reward
+            with pyprofile.push('rewarder.compute_reward'):
+                reward, done, info = self.reward()
+            # done=None means we're not sure if the game is over or
+            # not.
+            done = bool(done)
+
+            # Cut short the environment. Currently only used in debug
+            # environment.
+            if self.controlplane_spec is not None and \
+               self.controlplane_spec.server_timestep_limit is not None and \
+               frames >= self.controlplane_spec.server_timestep_limit:
+                logger.info('[%s] Marking environment as done=True since server_timestep_limit of %d frames reached', utils.thread_name(), frames)
+                done = True
+
+            # Add our own statistics
+            if time.time() - last_export > 5:
+                force_send = True
+                last_export = time.time()
+                profile = pyprofile.export()
+                # Send the pyprofile to the agent. Info keys we set
+                # will be available directly to the agent.
+                info['rewarder.profile'] = profile
+            else:
+                force_send = False
+
+            # Send if there's anything interesting to transmit
+            if reward != 0 or done or force_send:
+                if 'rewarder.profile' in info:
+                    # We already print the pyprofile (during the
+                    # export) so no need to repeat it here. It's
+                    # pretty big.
+                    display_info = info.copy()
+                    display_info['rewarder.profile'] = '<{} bytes>'.format(len(str(display_info['rewarder.profile'])))
+                else:
+                    display_info = info
+
+                reward_logger.record(reward, done, info)
+                self.agent_conn.send_env_reward(reward, done, info)
+
+            old_target = target
+            # Run at the appropriate frame rate
+            target += 1./self.fps
+
+            # Do appropriate sleeping
+            delta = target - time.time()
+            if done:
+                # game_autoresets means the game itself will do the
+                # reset, so we don't have to do any work.
+                logger.info('[%s] Resetting environment since done=%s', utils.thread_name(), done)
+                self.trigger_reset()
+            elif delta > 0:
+                pyprofile.timing('rewarder.sleep', delta)
+                time.sleep(delta)
+            else:
+                pyprofile.timing('rewarder.sleep.missed', -delta)
+                if delta < -0.1:
+                    logger.info('[%s] Rewarder fell behind by %ss from target; losing %s frames', utils.thread_name(), -delta, int(-delta * self.fps))
+                target = time.time()
+            # Record the total time spent in this frame, starting from the top
+            pyprofile.timing('rewarder.frame', time.time() - old_target)
+            frames += 1
+
+    def reward(self):
+        info = {}
+
+        if self.env is None:
+            return 0, False, info
+
+        screen, _, done, observation_info = self.env.step([])
+
+        # Copy over the staleness of the observation and the number of
+        # VNC updates in the last frame. This gets sent to the client.
+        lag = observation_info.get('diagnostics.lag.observation')
+        if lag is not None:
+            info['rewarder.lag.observation'] = lag[0]
+            info['rewarder.lag.observation.timestamp'] = time.time() - lag[0]
+        info['rewarder.vnc.updates.n'] = updates_n = observation_info.get('vnc.updates.n')
+        info['rewarder.vnc.updates.pixels'] = observation_info.get('vnc.updates.pixels')
+        info['rewarder.vnc.updates.bytes'] = observation_info.get('vnc.updates.bytes')
+
+        if updates_n is not None:
+            pyprofile.incr('reward.vnc.updates.n', updates_n)
+
+        now = time.time()
+        if self._has_initial_reward and info['rewarder.vnc.updates.n'] == 0:  # Nothing new!
+            # Timeout after 100 seconds without VNC updates.
+            # This means nothing on the screen has changed, which is probably very bad.
+            # We log the error and end the episode, hopefully it will recover nicely.
+            if now > self._vnc_last_update + 100:
+                logger.error('No vnc updates since {}'.format(self._vnc_last_update))
+                done = True
+            return 0, done, info
+        elif self.reward_parser is None:
+            return 0, done, info
+        self._vnc_last_update = now
+        self._has_initial_reward = True
+
+        reward, done, reward_info = self.reward_parser.reward(screen)
+        if (self.env_id == 'flashgames.NeonRace2-v0' and reward > 20000) or \
+           (self.env_id == 'flashgames.CoasterRacer-v0' and reward > 20000) or \
+           (self.env_id == 'internet.SlitherIO-v0' and reward > 1000):
+            import tempfile
+            f = tempfile.NamedTemporaryFile()
+            path = f.name + '.png'
+            f.close()
+
+            logger.info('[%s] Abnormally large reward of %s received! This may indicate a bug in the OCR. Saving a screenshot to %s for investigation.', utils.thread_name(), reward, path)
+            Image.fromarray(screen).save(path)
+        return reward, done, info
+
+class UserInput(threading.Thread):
+    def __init__(self, env, env_controller, error_buffer, rewarder):
+        super(UserInput, self).__init__(name='UserInput')
+        self.instance_id = utils.random_alphanumeric()
+        self.env = env
+        self.env_controller = env_controller
+        self.start_time = None
+
+        self.daemon = True
+        self.error_buffer = error_buffer
+        self.rewarder = rewarder
+
+    def run(self):
+        try:
+            self.do_run()
+        except Exception as e:
+            self.error_buffer.record(e)
+
+    def do_run(self):
+        self.start_time = time.time()
+
+        if six.PY2:
+            global input
+            input = raw_input
+        while True:
+            try:
+                input_command = input("""[UserInput] Input commands:
+  t [dump stacktrace]
+  i [ipdb session]
+  q [quit]
+""").strip()
+            except EOFError:
+                # True when stdin isn't open
+                return
+            split = input_command.split(' ')
+            command, args = split[0], split[1:]
+
+            try:
+                if command == 't':
+                    self.stacktraces()
+                elif command == 'i':
+                    import ipdb
+                    ipdb.set_trace()
+                elif command == 'q':
+                    logger.info('[%s] Exiting as requested', utils.thread_name())
+                    for proc in manual_subprocess_cleanup.values():
+                        proc.kill()
+                    os._exit(0)
+            except Exception as e:
+                if six.PY2:
+                    logger.error('[UserInput] Error processing command: %s', traceback.format_exc(e))
+                else:
+                    logger.error('[UserInput] Error processing command: %s', '\n'.join(traceback.format_exception(type(e), e, e.__traceback__)))
+
+    def stacktraces(self):
+        sys.stderr.write("\n*** STACKTRACE - START ***\n")
+        code = []
+        for threadId, stack in sys._current_frames().items():
+            code.append("\n# ThreadID: %s" % threadId)
+            for filename, lineno, name, line in traceback.extract_stack(stack):
+                code.append('\n>  File: "%s", line %d, in %s' % (filename,
+                                                            lineno, name))
+                if line:
+                    code.append("  %s" % (line.strip()))
+
+        for line in code:
+            sys.stderr.write(line)
+        sys.stderr.write("\n*** STACKTRACE - END ***\n")
+
+twisty.start_once()
+
+def write_env_id(env_id):
+    env_file = '/tmp/demo/env_id.txt'
+    if os.path.exists(os.path.dirname(env_file)):
+        try:
+            with open(env_file, 'w') as f:
+                logger.info('[%s] Writing %s to %s', utils.thread_name(), env_id, env_file)
+                f.write(env_id or '')
+                f.write('\n')
+        except PermissionError:
+            pass
+
+def main():
+    parser = argparse.ArgumentParser(description=None)
+    parser.add_argument('-v', '--verbose', action='count', dest='verbosity', default=0, help='Set verbosity.')
+    parser.add_argument('-r', '--remotes', default='vnc://127.0.0.1:5900', help='Which VNC address to connect to.')
+    parser.add_argument('-e', '--env-id', default=None, help='An env ID to optionally run upon startup (e.g. flashgames.DuskDrive-v0).')
+    parser.add_argument('-d', '--non-interactive', action='store_true', help='Treat as a daemon, and do not accept user input')
+    parser.add_argument('-V', '--no-vexpect', action='store_true', help='Whether to use vexpect.')
+    parser.add_argument('-S', '--no-scorer', action='store_true', help='Whether to use the scorer.')
+    parser.add_argument('-E', '--no-env', action='store_true', help='Whether to maintain an environment.')
+    parser.add_argument('-I', '--integrator-mode', action='store_true', help='Whether to use vexpect.')
+    parser.add_argument('-R', '--no-rewarder', action='store_true', help='Whether to enable the rewarder thread at all.')
+    parser.add_argument('--rewarder-fps', default=60, type=float, help='The frame rate for the rewarder.')
+    parser.add_argument('-t', '--terminate-on-disconnect', action='store_true', help='Terminate after last active user disconnects.')
+    parser.add_argument('-i', '--idle-timeout', default=None, type=float, help='How long to keep the environment around when it has no active connections')
+    parser.add_argument('--demonstration', action='store_true', help='Run a demonstration agent.')
+
+    args = parser.parse_args()
+
+    # TODO: only activate in dev
+    signal.signal(signal.SIGINT, lambda signal, frame: os._exit(10))
+
+    if args.verbosity == 0:
+        logger.setLevel(logging.INFO)
+    elif args.verbosity >= 1:
+        logger.setLevel(logging.DEBUG)
+
+    # Launch demonstration agent if requested
+    if args.demonstration and args.env_id is not None:
+        cmd = "/app/universe-envs/controlplane/bin/demonstration_agent.py -e {} 2>&1 | sed -e 's/^/[demonstration_agent] /'".format(pipes.quote(args.env_id))
+        logger.info('Launching demonstration agent: %s', cmd)
+        subprocess.Popen(cmd, shell=True)
+
+    logger.info("Starting play_controlplane.py with the following: command=%s args=%s env=%s", sys.argv, args, os.environ)
+
+    error_buffer = universe.utils.ErrorBuffer()
+
+    env_status = universe.rewarder.EnvStatus()
+    env_status.env_id = args.env_id
+
+    cv = threading.Condition()
+    control_buffer = remote.ControlBuffer()
+    agent_conn = remote.AgentConn(env_status, cv, control_buffer)
+    agent_conn.listen()
+
+    # Logger gives us the diagnostics printing
+    if not args.no_env:
+        env = wrappers.Unvectorize(wrappers.Logger(vnc_env.VNCEnv()))
+        # Assert when given self-referential rewarder connection
+        # This shows up as a '+15900' or similar port number in the remotes string
+        assert '+' not in args.remotes, "Remotes may not have rewarder ports"
+        env.configure(
+            remotes=args.remotes,
+            ignore_clock_skew=True,
+            disable_action_probes=True,
+            vnc_driver='go',
+            vnc_kwargs={'encoding': 'zrle', 'compress_level': 9},
+        )
+    else:
+        logger.info('Running without environment, meaning reward and gameover parsing will be disabled')
+        env = None
+
+    no_vexpect = args.no_vexpect or args.integrator_mode
+
+    env_controller = EnvController(
+        env, args.remotes, env_status, agent_conn,
+        error_buffer=error_buffer, control_buffer=control_buffer,
+        no_vexpect=no_vexpect,
+        integrator_mode=args.integrator_mode,
+        terminate_on_disconnect=args.terminate_on_disconnect,
+        idle_timeout=args.idle_timeout
+    )
+    env_controller.start()
+
+    if not args.no_rewarder:
+        rewarder = Rewarder(
+            env, args.remotes, agent_conn,
+            env_status=env_controller.env_status,
+            trigger_reset=env_controller.trigger_reset,
+            error_buffer=error_buffer, no_vexpect=no_vexpect,
+            no_scorer=args.no_scorer,
+            fps=args.rewarder_fps,
+        )
+        rewarder.start()
+    else:
+        rewarder = None
+
+    if args.non_interactive:
+        logger.info("Running in non-interactive mode, user input disabled")
+    else:
+        user_input = UserInput(
+            env=env,
+            env_controller=env_controller,
+            error_buffer=error_buffer,
+            rewarder=rewarder)
+        user_input.start()
+
+    # TODO: clean up this API, but good enough for now
+    while True:
+        try:
+            error_buffer.blocking_check(timeout=60)
+        except Exit as e:
+            logger.info('%s', e)
+            return 0
+
+    return 1
+
+if __name__ == '__main__':
+    sys.exit(main())

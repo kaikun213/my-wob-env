@@ -1,0 +1,20 @@
+version: '2'
+services:
+  world-of-bits:
+    ipc: host
+    image: my-world-of-bits-image
+    volumes:
+      - .:/app
+    ports:
+      - "5900:5900"
+      - "5899:5899"
+      - "15900:15900"
+      - "15899:15899"
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    environment:
+      ENABLE_PUBLIC: "true"
+    command:
+      - run
+    container_name: my-world-of-bits-container

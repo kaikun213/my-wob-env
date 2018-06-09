@@ -1,0 +1,165 @@
+#!/bin/sh
+
+set -eu
+
+# Figure out what port to run things on. PORT_OFFSET is necessary
+# mostly if running multiple env containers in a single pod.
+display=${DISPLAY#*:}
+port=5900
+if ! [ -z "${PORT_OFFSET:-}" ]; then multitenant=true
+    # TODO: for some reason doing '((x=0+0)); echo $?' returns 1. So
+    # just ignore return values here for now.
+    ((display=display+2*PORT_OFFSET)) || :
+    ((port=port+PORT_OFFSET))
+else
+    multitenant=false
+fi
+vnc_proxy_port=`expr $port - 1`
+vnc_websocket_port=`expr $port + 1`
+rewarder_port=15900
+rewarder_proxy_port=`expr $rewarder_port -  1`
+
+touch /tmp/openai.log
+chmod 777 /tmp/openai.log
+
+/app/universe-envs/base/openai-setpassword
+
+/app/universe-envs/base/openai-tigervnc -ZlibLevel 0 2>&1 | sed -e 's/^/[tigervnc] /' &
+
+# Wait for X to start
+file="/tmp/.X11-unix/X$display"
+for i in $(seq 1 10); do
+    if [ -e "$file" ]; then
+    break
+    fi
+
+    echo "[$(date)] Waiting for $file to be created (try $i/10)"
+    sleep "$i"
+done
+
+# Grab the first command, and shift all other parameters to be passed
+# along to demonstration_agent.py or play_flashgames.py
+cmd=${1:-run}
+shift
+
+###################
+# SECURITY CRITICAL
+
+# DO NOT DISABLE THIS. This prevents (potentially untrusted) users of
+# this container from snooping around our network:
+xvnc=127.0.0.1
+iptables -A OUTPUT -p tcp -m tcp --dport "${port}" --dst "$xvnc" -j ACCEPT # allow VNC (for macros)
+iptables -A OUTPUT -p tcp -m tcp --dst 127.0.0.1 -j ACCEPT # allow localhost traffic (for selenium, and maybe VNC)
+iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT # allow us to reply to inboud connections (for rewarder + VNC)
+
+# Also allow the env to connect to our cache DB.
+# TODO: in the future, we probably want to have a separate db server within the container, so we can run containers on independent machines.
+if ! [ -z "${TURK_DB:-}" ]; then
+  echo "Enabling IP access to TURK DB on host"
+  TURK_HOST=$(echo $TURK_DB | cut -d : -f 1)
+  TURK_PORT=$(echo $TURK_DB | cut -d : -f 2)
+  iptables -A OUTPUT -p tcp -d $TURK_HOST --dport $TURK_PORT -j ACCEPT
+fi
+
+# drop outbound connections selectively if we are in data collection modes.
+# iptables will follow the rules in order until it hit an ACCEPT, DROP or REJECT.
+# these modes include 'demonstration', 'turk', 'turk-dev'.
+if [ $cmd = demonstration ] || [ $cmd = 'turk' ] || [ $cmd = 'turk-dev' ] || [ $cmd = 'dev' ] || [ $cmd = 'run' ]; then
+  echo "[$0] [$(date)] [Warning] Demo mode. Disable outbound network only partially!"
+
+  # Drop EC2 metadata IP
+  iptables -A OUTPUT -d 169.254.169.254 -j REJECT
+  iptables -A OUTPUT -p tcp -m tcp --dport 53 -j ACCEPT # allow DNS (TODO: maybe just to IP in resolv.conf)
+  iptables -A OUTPUT -p udp -m udp --dport 53 -j ACCEPT # allow DNS
+
+  # Make port 80/443 outbound accessible!
+  iptables -A OUTPUT -d 10.0.0.0/8 -j REJECT
+  iptables -A OUTPUT -p tcp -m multiport --dports 80,443 -j ACCEPT
+
+  # Drop internal traffic
+  iptables -A OUTPUT -d 192.168.0.0/16 -j REJECT
+  iptables -A OUTPUT -d 172.16.0.0/12 -j REJECT
+  iptables -A OUTPUT -d 10.0.0.0/8 -j REJECT
+  
+  # TODO: a stricter rule would be to drop traffic irrelavant to the considered website.
+  # this could be hard because we don't know what other services this website might send request to.
+else
+  # If we are in env mode (training, testing, running) of agent,
+  # we will disable all outbound traffic for security reasons.
+  # for real world-of-bits websites, this does not affect anything since the 
+  # traffic is all cached during data mode for reproducibility reasons.
+  echo "[$0] [$(date)] Disabling outbound network traffic"
+  iptables -A OUTPUT -j REJECT
+fi
+##################
+
+cd "$(dirname "$0")"
+
+# Clean up any old Chrome state. Mostly relevant for docker-compose
+# (where contairs are restarted multiple times).
+rm -rf /tmp/.com.google.Chrome* ~gym/.cache ~gym/.config
+
+# start simple http server to serve local content
+( cd /app/universe-envs/world-of-bits/static && python -m http.server 80 >>/tmp/openai.log 2>&1 ) &
+
+# faketime
+export LD_PRELOAD=/usr/local/lib/python3.5/dist-packages/faketime/libfaketime.so.1
+# export FAKETIME=${FAKETIME:-"@2016-10-1 20:00:00"}
+export FAKETIME=""
+
+certutil certutil -d ~/.pki/nssdb -A -t "C,," -n "My Homemade CA" -i ~/.mitmproxy/mitmproxy-ca.pem
+
+# magic line from greg that is supposed to fix the fact that wob sometimes doesnt start with like 10% chance
+export DBUS_SESSION_BUS_ADDRESS=/dev/null
+
+alias SUDO="exec sudo LD_PRELOAD=\$LD_PRELOAD FAKETIME=\"\$FAKETIME\" -H DISPLAY=:\$display DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
+
+# if this environment was spawned by the allocator, add an idle timeout to the args
+if ! [ -z "${ALLOCATOR_MODE:-}" ]; then
+    echo "Allocator mode detected, adding idle timeout"
+    set -- $@ '--idle-timeout=900';
+else
+    echo "Not running in allocator mode"
+fi
+
+case "$cmd" in
+    shell)
+        SUDO TURK_DB=$TURK_DB bash
+        ;;
+    run)
+        set -x # https://www.gnu.org/software/bash/manual/html_node/The-Set-Builtin.html
+        SUDO bin/run.py --mode ENV "$@"
+        ;;
+    dev)
+        set -x # https://www.gnu.org/software/bash/manual/html_node/The-Set-Builtin.html
+        SUDO TURK_DB=$TURK_DB bin/run.py --mode ENV "$@"
+        ;;
+    demonstration)
+        mkdir -p /tmp/demo
+        touch /tmp/demo/env_id.txt
+        chown nobody: /tmp/demo/env_id.txt
+        /app/universe/bin/reward_recorder.py 2>&1 | sed -e 's/^/[reward_recorder] /' &
+        /app/universe/bin/vnc_recorder.py 2>&1 | sed -e 's/^/[vnc_recorder] /' &
+        /app/universe-envs/controlplane/bin/demonstration_agent.py "$@" 2>&1 | sed -e 's/^/[demonstration_agent] /' &
+        SUDO TURK_DB=$TURK_DB bin/run.py "$@" ${GYM_FLAGS:-}
+        ;;
+    turk)
+      mkdir -p /tmp/demo
+      touch /tmp/demo/env_id.txt
+      chown nobody: /tmp/demo/env_id.txt
+      /app/universe/bin/dual_recorder_s3.py -l 0.0.0.0:$vnc_proxy_port -s localhost:$port -r 0.0.0.0:$rewarder_proxy_port -t localhost:$rewarder_port -b openai-vnc-wob-demonstrations &
+      /vendor/websockify/run $vnc_websocket_port localhost:$vnc_proxy_port &
+      SUDO TURK_DB=$TURK_DB bin/run.py "$@" ${GYM_FLAGS:-}
+      ;;
+    turk-dev)
+      mkdir -p /tmp/demo
+      touch /tmp/demo/env_id.txt
+      chown nobody: /tmp/demo/env_id.txt
+      /app/universe/bin/dual_recorder_s3.py -l 0.0.0.0:$vnc_proxy_port -s localhost:$port -r 0.0.0.0:$rewarder_proxy_port -t localhost:$rewarder_port -b openai-vnc-wob-demonstrations-dev &
+      /vendor/websockify/run $vnc_websocket_port localhost:$vnc_proxy_port &
+      SUDO TURK_DB=$TURK_DB bin/run.py "$@" --mode DATA ${GYM_FLAGS:-}
+      ;;
+    *)
+      echo "Bad command: $cmd"
+    ;;
+esac

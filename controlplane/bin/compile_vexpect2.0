@@ -1,0 +1,663 @@
+#!/usr/bin/env python
+import argparse
+import gym_demonstration
+import logging
+import numpy as np
+import os
+import re
+import six
+import sys
+
+from universe import spaces
+import gym_controlplane
+from gym_controlplane import error, integration
+
+logger = logging.getLogger()
+
+def build_vexpect(src_dir, parse, vexpect):
+    states = {}
+    transitions = build_transitions(parse)
+
+    if vexpect is not None:
+        # Start with the existing states
+        states.update(vexpect.states)
+        # Stick to the existing transitions where possible
+        transitions.update(vexpect.transitions)
+
+    if parse.ready_name is not None:
+        state = integration.MaskState(
+            state_name=parse.ready_name,
+            mask=parse.ready_mask,
+            pixel_info=parse.ready_pixel_info,
+            metadata=parse.ready_metadata,
+            stage='ready',
+        )
+        states[state.state_name] = state
+    if parse.gameover_name is not None:
+        state = integration.MaskState(
+            state_name=parse.gameover_name,
+            mask=parse.gameover_mask,
+            pixel_info=parse.gameover_pixel_info,
+            metadata=parse.gameover_metadata,
+            stage='gameover',
+        )
+        states[state.state_name] = state
+
+    for i, (mask, pixel_info, name, metadata) in enumerate(zip(parse.initializing_masks, parse.initializing_pixel_infos, parse.initializing_names, parse.initializing_metadatas)):
+        if i == 0:
+            stage = 'initial'
+        else:
+            stage = None
+        state = integration.MaskState(
+            state_name=name,
+            mask=mask,
+            pixel_info=pixel_info,
+            metadata=metadata,
+            stage=stage,
+            cooloff=3,
+        )
+        states[state.state_name] = state
+
+    vexpect = integration.VExpect(states=states, transitions=transitions)
+    vexpect.save(src_dir)
+
+def build_transitions(parse):
+    transitions = {}
+    for idx, name in enumerate(parse.initializing_names):
+        event = parse.transitions[name]
+
+        if idx < len(parse.initializing_names) - 1:
+            dsts = [parse.initializing_names[idx+1]]
+        else:
+            # Need to support more than one here
+            dsts = [parse.ready_name]
+
+        if event[0] == 'PointerEvent':
+            transition = integration.ClickTransition(
+                src=name,
+                dsts=dsts,
+                x=event[1],
+                y=event[2],
+                buttonmask=event[3],
+            )
+        else:
+            assert event[0] == 'KeyEvent'
+            transition = integration.KeyPressTransition(
+                src=name,
+                dsts=dsts,
+                key=event[1],
+            )
+        transitions[name] = transition
+
+    for name in [parse.ready_name]:
+        transitions[name] = integration.ClickTransition(
+            src=name,
+            dsts=[],
+            x=0,
+            y=0,
+            buttonmask=0,
+        )
+    return transitions
+
+def filter_pixels(filter, mask, error_threshold=1000, observation=None):
+    matches = filter.all(axis=2)[:, :, np.newaxis]
+    matches = np.broadcast_to(matches, filter.shape)
+    filtered = np.where(matches, mask, 0)
+
+    if error_threshold is not None:
+        count = len(np.where(filtered != 0)[0])
+        if count < error_threshold:
+            orig_count = len(np.where(mask != 0)[0])
+            if observation is not None:
+                from PIL import Image
+                Image.fromarray(observation).show()
+            raise error.Error('Too few pixels in mask: {} -> {}'.format(orig_count, count))
+    return filtered
+
+def fast_forward(timestamps, i, forward_time):
+    target = timestamps[i] + forward_time
+
+    if forward_time >= 0:
+        while i < len(timestamps) and timestamps[i] < target:
+            i += 1
+        if i >= len(timestamps):
+            return None
+    else:
+        while i >= 0 and timestamps[i] >= target:
+            i -= 1
+        if i < 0:
+            return None
+    return i
+
+def capturable(event):
+    if isinstance(event, spaces.PointerEvent) and event.buttonmask != 0:
+        return True
+    elif isinstance(event, spaces.KeyEvent) and event.down:
+        return True
+
+def keycode(sym):
+    return spaces.KeyEvent.by_name(sym).key
+
+class ParseState(object):
+    def __init__(self, gameover_only=None):
+        # Long-term state
+        self.observation_u = []
+        self.action_ui = []
+        self.mouse_ui = []
+        self.timestamp_u = []
+        self.state_idxs = {}
+
+        # Convenient
+        self.last_mouse_move_ui = []
+
+        # Intermediate mutable state
+        if gameover_only:
+            self.state = 'gameover'
+        else:
+            self.state = 'initializing'
+        self.mouse_x = None
+        self.mouse_y = None
+        self.gameover_location = None
+
+        # Existing state to merge into
+        self.existing_masks = {}
+        self.existing_pixel_infos = {}
+        self.existing_metadatas = {}
+
+        # Timings
+        self.last_mouse_move = None
+        self.last_state_transition = None
+
+        # Output
+        self.transitions = {}
+
+        self.ready_mask = None
+        self.ready_pixel_info = None
+        self.ready_name = None
+        self.ready_metadata = None
+
+        self.gameover_mask = None
+        self.gameover_pixel_info = None
+        self.gameover_name = None
+        self.gameover_metadata = None
+
+        self.initializing_masks = []
+        self.initializing_pixel_infos = []
+        self.initializing_names = []
+        self.initializing_metadatas = []
+
+    def state_i(self, name):
+        return self.state_idxs[name][0]
+
+    def save(self, path):
+        np.save(path, {
+            'ready_mask': self.ready_mask,
+            'ready_pixel_info': self.ready_pixel_info,
+            'ready_name': self.ready_name,
+            'ready_metadata': self.ready_metadata,
+
+            'gameover_mask': self.gameover_mask,
+            'gameover_pixel_info': self.gameover_pixel_info,
+            'gameover_name': self.gameover_name,
+            'gameover_metadata': self.gameover_metadata,
+
+            'initializing_masks': self.initializing_masks,
+            'initializing_pixel_infos': self.initializing_pixel_infos,
+            'initializing_names': self.initializing_names,
+            'initializing_metadatas': self.initializing_metadatas,
+
+            'transitions': self.transitions,
+        })
+
+    @classmethod
+    def load(cls, path):
+        data = np.load(path).tolist()
+        parse = ParseState()
+        parse.ready_mask = data['ready_mask']
+        parse.ready_pixel_info = data['ready_pixel_info']
+        parse.ready_name = data['ready_name']
+        parse.ready_metadata = data['ready_metadata']
+
+        parse.gameover_mask = data['gameover_mask']
+        parse.gameover_pixel_info = data['gameover_pixel_info']
+        parse.gameover_name = data['gameover_name']
+        parse.gameover_metadata = data['gameover_metadata']
+
+        parse.initializing_masks = data['initializing_masks']
+        parse.initializing_pixel_infos = data['initializing_pixel_infos']
+        parse.initializing_names = data['initializing_names']
+        parse.initializing_metadatas = data['initializing_metadatas']
+
+        parse.transitions = data['transitions']
+        return parse
+
+class Parser(object):
+    def __init__(self, demo_path, gameover_only):
+        self.demo_path = demo_path
+        self.gameover_only = gameover_only
+
+    def build_transitions(self, parse):
+        # All the clicks up through the ready state
+        for idx, name in enumerate(parse.initializing_names):
+            i, j = parse.state_idxs[name]
+            event = parse.action_ui[i][j]
+            parse.transitions[name] = event.compile()
+
+    def pixel_info(self, parse, state_name, stage, mask, previous_state_i, state_i, metadata, existing_pixel_info):
+        # Scan from the transition time of the previous state up to
+        # the current, and mark the first time each pixel value is
+        # seen
+
+        # We store these as pngs (so really, np.uint24s), and use the
+        # maxvalue there for our sentinel.
+
+        # Compute mouse distances
+        i, j = parse.state_idxs[state_name]
+        mouse_x, mouse_y = parse.mouse_ui[i][j]
+        mouse_distance = np.sqrt(np.arange(-mouse_y, mask.shape[0]-mouse_y)[:, np.newaxis]**2 + np.arange(-mouse_x, mask.shape[1]-mouse_x)[np.newaxis, :]**2)
+        mouse_distance = np.where((mask == 0).all(axis=2), 0, mouse_distance)
+
+        # Compute pixel ages
+        pixel_age = np.zeros((mask.shape[0], mask.shape[1]), dtype=np.float32) - 1
+        # Just look at valid pixels
+        pixel_age = np.where((mask == 0).all(axis=2), 0, pixel_age)
+        observations = parse.observation_u[previous_state_i:state_i+1]
+        for i, observation in enumerate(observations):
+            x, y = np.where((observation == mask).all(axis=2) & (pixel_age == -1))
+            if len(x) == 0:
+                # No new pixels
+                continue
+
+            idx = len(observations) - i - 1
+            logger.info('[%s] Setting %d entries to age %d', stage, len(x), idx)
+            pixel_age[x, y] = idx
+        assert not np.any(pixel_age == -1), 'Still had {} -1s'.format(len(np.where(pixel_age == -1)))
+
+        if existing_pixel_info is not None:
+            # Take weighted sum of the new pixel info and old ones
+            pixel_age /= (metadata['pixel_info.count'] + 1.)
+            pixel_age += existing_pixel_info['pixel_age'] * metadata['pixel_info.count'] / (metadata['pixel_info.count'] + 1.)
+
+            mouse_distance /= (metadata['pixel_info.count'] + 1.)
+            mouse_distance += existing_pixel_info['mouse_distance'] * metadata['pixel_info.count'] / (metadata['pixel_info.count'] + 1.)
+
+            metadata['pixel_info.count'] += 1
+        else:
+            metadata['pixel_info.count'] = 1
+
+        return {
+            'pixel_age': pixel_age.astype(np.uint32),
+            'mouse_distance': mouse_distance.astype(np.uint32),
+        }
+
+    def build_initializing_masks(self, parse):
+        for initializing_number, state_name in enumerate(parse.initializing_names):
+            self.build_initializing_masks_i(parse, initializing_number, state_name)
+
+    def build_initializing_masks_i(self, parse, initializing_number, state_name):
+        state_i, state_j = parse.state_idxs[state_name]
+        logger.info('Building initializing mask: initializing_number=%s state_i=%d state_name=%s', initializing_number, state_i, state_name)
+
+        # For initializing state: we scan backwards by 5s, and grab
+        # all constant pixels. We then scan backwards filtering any
+        # pixels which appeared leading up to the previous state
+        # triggering. We scan forward filtering any pixels which
+        # appeared before the next state triggers. Finally, we
+        # calculate the time at which each surving pixel was first
+        # seen.
+
+        # Find location of previous state
+        if initializing_number >= 2:
+            previous_state = parse.initializing_names[initializing_number-1]
+            previous_state_i = parse.state_i(previous_state)
+
+            double_previous_state = parse.initializing_names[initializing_number-2]
+            double_previous_state_i = parse.state_i(double_previous_state)
+        elif initializing_number == 1:
+            previous_state = parse.initializing_names[initializing_number-1]
+            previous_state_i = parse.state_i(previous_state)
+            double_previous_state_i = None
+        else:
+            previous_state = None
+            previous_state_i = None
+
+        # Find location of next state
+        if state_i < len(parse.initializing_names) - 2:
+            next_state = parse.initializing_names[initializing_number+1]
+            next_state_i = parse.state_i(next_state_i)
+
+            double_next_state = parse.initializing_names[initializing_number+2]
+            double_next_state_i = parse.state_i(double_next_state)
+        elif state_i < len(parse.initializing_names) - 1:
+            next_state = parse.initializing_names[initializing_number+1]
+            next_state_i = parse.state_i(next_state)
+            double_next_state_i = None
+        else:
+            # TODO: use ready state here
+            next_state = None
+            next_state_i = None
+            double_next_state_i = None
+
+        # Sometimes state_i reflects the state after the click, so we
+        # grab state_i-1.
+        try:
+            mask = parse.existing_masks[state_name]
+            metadata = parse.existing_metadatas[state_name]
+            pixel_info = parse.existing_pixel_infos[state_name]
+        except KeyError:
+            mask = parse.observation_u[state_i-1]
+            metadata = {}
+            pixel_info = None
+
+        # Scan backward until the last mouse movement, keeping
+        # constant pixels.
+        backward = parse.last_mouse_move_ui[state_i][state_j]
+        if previous_state_i is not None and backward < previous_state_i:
+            logger.info('Have not moved mouse since previous state: backward=%s previous_state_i=%s', backward, previous_state_i)
+            backward = previous_state_i+1
+
+        elapsed = parse.timestamp_u[state_i] - parse.timestamp_u[backward]
+        logger.info('Scanning previous %.3fs (until previous mouse movement) for constant pixels: start=%s end=%s', elapsed, backward, state_i-1)
+        # Scan up to the relevant state. Note we don't know whether
+        # state_i includes pixels from the next state or not.
+        for observation in parse.observation_u[backward:state_i]:
+            mask = filter_pixels(mask == observation, mask, observation=observation)
+
+        if previous_state_i is not None:
+            # Filter out all pixels seen during the previous state, being
+            # deliberate about not going up to previous_state itself,
+            # which might contain pixels from post click
+            logger.info('Filtering previous state pixels: start=%s end=%s', double_previous_state_i, previous_state_i)
+            for observation in parse.observation_u[double_previous_state_i:previous_state_i]:
+                mask = filter_pixels(mask != observation, mask, observation=observation)
+
+        if next_state_i is not None:
+            # Filter out all pixels seen during the next state. (We might
+            # want to do double_next_state_i+1 to handle the boundary
+            # deliberately.)
+            logger.info('Filtering next state pixels: start=%s end=%s', next_state_i, double_next_state_i)
+            for observation in parse.observation_u[next_state_i:double_next_state_i]:
+                mask = filter_pixels(mask != observation, mask, observation=observation)
+
+        pixel_info = self.pixel_info(parse, state_name, 'initializing', mask, previous_state_i, state_i, metadata, pixel_info)
+
+        parse.initializing_pixel_infos.append(pixel_info)
+        parse.initializing_masks.append(mask)
+        parse.initializing_metadatas.append(metadata)
+
+    def build_ready_mask(self, parse):
+        if parse.ready_name is None:
+            logger.info('Skipping ready mask build since no ready state marked')
+            return
+
+        logger.info('Building ready mask')
+        state_name = parse.ready_name
+        state_i = parse.state_i(parse.ready_name)
+
+        # For ready state: we scan forward by 5s, and grab all
+        # constant pixels. We then scan backwards filtering any pixels
+        # which appeared leading up to the previous state
+        # triggering. Finally, we calculate the time at which each
+        # surving pixel was first seen.
+
+        # Deliberately grab state_i, which will definitely reflect the
+        # current state since the user is just marking an existing
+        # state of the world.
+        try:
+            mask = parse.existing_masks[state_name]
+            metadata = parse.existing_metadatas[state_name]
+            pixel_info = parse.existing_pixel_infos[state_name]
+        except KeyError:
+            mask = parse.observation_u[state_i]
+            metadata = {}
+            pixel_info = None
+
+        if len(parse.initializing_names) >= 2:
+            previous_state = parse.initializing_names[-1]
+            previous_state_i = parse.state_i(previous_state)
+
+            double_previous_state = parse.initializing_names[-2]
+            double_previous_state_i = parse.state_i(double_previous_state)
+        elif len(parse.initializing_names) == 1:
+            previous_state = parse.initializing_names[-1]
+            previous_state_i = parse.state_i(previous_state)
+            double_previous_state_i = None
+        else:
+            previous_state = None
+            previous_state_i = None
+
+        # Scan forward by 5s, keeping constant pixels
+        forward = fast_forward(parse.timestamp_u, state_i, 5)
+        logger.info('Scanning next 5s from %s for constant pixels: start=%s end=%s', state_name, state_i, forward)
+        for observation in parse.observation_u[state_i:forward]:
+            mask = filter_pixels(mask == observation, mask, observation=observation)
+
+        # Scan through entire previous state, dropping any matching
+        # pixels. We ignore the boundary frame between this and the
+        # previous state.
+        if previous_state_i is not None:
+            logger.info('Filtering previous state pixels for ready: start=%s end=%s', double_previous_state_i, previous_state_i)
+            for observation in parse.observation_u[double_previous_state_i:previous_state_i]:
+                mask = filter_pixels(mask != observation, mask, observation=observation)
+
+        pixel_info = self.pixel_info(parse, state_name, 'ready', mask, previous_state_i, state_i, metadata, pixel_info)
+
+        parse.ready_pixel_info = pixel_info
+        parse.ready_metadata = metadata
+        parse.ready_mask = mask
+
+    def build_gameover_mask(self, parse):
+        if parse.gameover_name is None:
+            logger.info('Skipping gameover mask build since no gameover state marked')
+            return
+
+        logger.info('Building gameover mask')
+        state_name = parse.gameover_name
+        state_i = parse.state_i(parse.gameover_name)
+
+        # For gameover state: we scan forward by 5s, and grab all
+        # constant pixels. Then we calculate the time at which each
+        # surving pixel was first seen.
+
+        try:
+            mask = parse.existing_masks[state_name]
+            metadata = parse.existing_metadatas[state_name]
+            pixel_info = parse.existing_pixel_infos[state_name]
+        except KeyError:
+            mask = parse.observation_u[state_i]
+            metadata = {}
+            pixel_info = None
+        if parse.ready_name is not None:
+            previous_state_i = parse.state_i(parse.ready_name)
+        else:
+            previous_state_i = None
+
+        # Scan forward by 5s, keeping constant pixels
+        forward = fast_forward(parse.timestamp_u, state_i, 5)
+        logger.info('Scanning next 5s from %s for constant pixels: start=%s end=%s', state_name, state_i, forward)
+        for observation in parse.observation_u[state_i:forward]:
+            mask = filter_pixels(mask == observation, mask)
+
+        # Now find the age of pixels throughout gameplay
+        pixel_info = self.pixel_info(parse, state_name, 'gameover', mask, previous_state_i, state_i, metadata, pixel_info)
+
+        parse.gameover_pixel_info = pixel_info
+        parse.gameover_metadata = metadata
+        parse.gameover_mask = mask
+
+    def run(self, vexpect=None):
+        parse = ParseState(self.gameover_only)
+        if vexpect is not None:
+            for name, state in six.iteritems(vexpect.states):
+                # TODO: make copies here
+                parse.existing_masks[name] = state.mask_matcher._mask
+                parse.existing_metadatas[name] = state.metadata
+                parse.existing_pixel_infos[name] = state.mask_matcher._pixel_info
+
+        numerics = {}
+        for i in range(10):
+            code = keycode(str(i))
+            numerics[code] = i
+
+        backslash_code = keycode('\\')
+
+        reader = gym_demonstration.VNCReader(self.demo_path, omit_reward=True)
+        for i, (observation, reward, done, info, action) in enumerate(reader):
+            if i == 0:
+                initial_timestamp = info['reader.timestamp']
+                delta = 0
+
+                parse.last_state_transition = delta
+                parse.last_mouse_move = i
+            else:
+                delta = info['reader.timestamp'] - initial_timestamp
+            # We need to copy since the reader just mutates a pair of
+            # fixed buffers
+            #
+            # We probably don't need to do this in the long term.
+            parse.observation_u.append(observation.copy())
+            parse.timestamp_u.append(delta)
+            parse.action_ui.append(action)
+
+            mouse_locations = []
+            mouse_moves = []
+            parse.mouse_ui.append(mouse_locations)
+            parse.last_mouse_move_ui.append(mouse_moves)
+            for j, event in enumerate(action):
+                if isinstance(event, spaces.PointerEvent):
+                    if parse.mouse_x != event.x or parse.mouse_y != event.y:
+                        parse.last_mouse_move = i
+                    parse.mouse_x = event.x
+                    parse.mouse_y = event.y
+                # Record current mouse location
+                mouse_locations.append((parse.mouse_x, parse.mouse_y))
+                mouse_moves.append(parse.last_mouse_move)
+
+                if parse.state == 'initializing':
+                    if isinstance(event, spaces.KeyEvent) and event.key in numerics and event.down:
+                        # When user presses 0-9, we generate the appropriate ready state
+                        parse.state = 'ready'
+                        state_name = 'ready{}'.format(numerics[event.key])
+                        parse.state_idxs[state_name] = (i, j)
+                        parse.ready_name = state_name
+                        logger.info('Adding ready state: %s. parse.state=%s', state_name, parse.state)
+                    elif capturable(event):
+                        state_name = 'initializing{}'.format(len(parse.initializing_names))
+
+                        last_mouse_move_time = parse.timestamp_u[parse.last_mouse_move]
+                        # User advanced through the menu too quickly
+                        if delta - parse.last_state_transition < 0.5:
+                            raise error.Error('Bad demonstration: {} submitted {}s after last state transition'.format(event, delta - parse.last_state_transition))
+                        elif delta - last_mouse_move_time < 0.5:
+                            raise error.Error('Bad demonstration: mouse was moved {}s before actions for {}'.format(delta - last_mouse_move_time, state_name))
+
+                        parse.state_idxs[state_name] = (i, j)
+                        parse.initializing_names.append(state_name)
+                        logger.info('Adding initializing state: %s. parse.state=%s', state_name, parse.state)
+                elif parse.state == 'ready':
+                    if isinstance(event, spaces.KeyEvent) and event.key == backslash_code and event.down:
+                        parse.gameover_location = (i, j)
+                        parse.gameover_name = 'gameover0'
+                        parse.state = 'gameover'
+                        logger.info('Adding gameover state: %s. parse.state=%s', parse.gameover_name, parse.state)
+                    elif capturable(event) and delta - parse.last_state_transition < 5:
+                        raise error.Error('Bad demonstration: {} submitted {}s after transitioning to ready state. Must avoid submitting actions for 5s.'.format(action, delta - parse.last_state_transition))
+                elif parse.state == 'gameover':
+                    if isinstance(event, spaces.KeyEvent) and event.key in numerics and event.down:
+                        # We re-label the gameover state according to
+                        # the user's desires
+                        parse.gameover_name = 'gameover{}'.format(i)
+                        logger.info('Changing gameover state name: %s. parse.state=%s', parse.gameover_name, parse.state)
+                    elif capturable(event) and delta - parse.last_state_transition < 5:
+                        raise error.Error('Bad demonstration: {} submitted {}s after transitioning to gameover state. Must avoid submitting actions for 5s.'.format(action, delta - parse.last_state_transition))
+
+        if parse.gameover_name is not None:
+            parse.state_idxs[parse.gameover_name] = parse.gameover_location
+
+            last_time = parse.timestamp_u[-1]
+            i, j = parse.gameover_location
+            gameover_time = parse.timestamp_u[i]
+
+            if last_time - gameover_time < 5:
+                raise error.Error('Bad demonstration: only {}s of gameover state captured. Need at least 5s'.format(last_time - gameover_time))
+
+        self.build_transitions(parse)
+        self.build_initializing_masks(parse)
+        self.build_ready_mask(parse)
+        self.build_gameover_mask(parse)
+        return parse
+
+def main():
+    parser = argparse.ArgumentParser(description=None)
+    parser.add_argument('-v', '--verbose', action='count', dest='verbosity', default=0, help='Set verbosity.')
+    parser.add_argument('-e', '--env-id', help='ID of the environment.')
+    parser.add_argument('-s', '--subdir', help='Generate as a subdirectory.')
+    parser.add_argument('-g', '--gameover-only', action='store_true', help='Assume game starts in the running state.')
+    parser.add_argument('-d', '--demo', help='Path to demonstration directory.')
+    parser.add_argument('-P', '--save-parse-state', help='Path to save parse state. Do not complete compilation.')
+    parser.add_argument('-p', '--parse-state', help='Path to parse state to use.')
+    parser.add_argument('-r', '--replace', action='store_true', help='Completely replace an existing vexpect.')
+    args = parser.parse_args()
+
+    if args.verbosity == 0:
+        logger.setLevel(logging.INFO)
+    elif args.verbosity >= 1:
+        logger.setLevel(logging.DEBUG)
+
+    dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../out/demo'))
+    if args.demo is not None:
+        demo = args.demo
+    else:
+        demos = [d for d in os.listdir(dir) if re.search('^\d+-', d)]
+        demo = os.path.join(dir, max(demos))
+        logger.info('Using most recent demo: %s', demo)
+
+    if args.env_id:
+        env_id = args.env_id
+    else:
+        env_id_path = os.path.join(dir, 'env_id.txt')
+        env_id = None
+        if os.path.exists(env_id_path):
+            with open(env_id_path) as f:
+                env_id = f.read().strip()
+        if not env_id:
+            parser.error('No -e provided, and {}/env_id.txt does not contain an env_id'.format(env_id_path))
+        logger.info('Using env_id of %s', env_id)
+
+    controlplane_spec = gym_controlplane.spec(id=env_id)
+    env_id = controlplane_spec.id
+
+    if env_id is not None:
+        # src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../src', env_id, 'vexpect'))
+        src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../build/private', env_id, 'vexpect'))
+        build_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../build/bulk', env_id, 'vexpect'))
+
+        if args.subdir:
+            src_dir = os.path.join(src_dir, args.subdir)
+            build_dir = os.path.join(build_dir, args.subdir)
+    else:
+        src_dir = None
+        build_dir = None
+
+    if not args.replace and os.path.exists(src_dir):
+        logger.info('Merging with existing VExpect: %s', src_dir)
+        vexpect = integration.VExpect.load(src_dir)
+    else:
+        vexpect = None
+
+    if args.parse_state is not None:
+        parse = ParseState.load(args.parse_state)
+    else:
+        parser = Parser(demo, gameover_only=args.gameover_only)
+        parse = parser.run(vexpect)
+
+    if args.save_parse_state is not None:
+        logger.info('Writing parsed state: %s', args.save_parse_state)
+        parse.save(args.save_parse_state)
+    else:
+        build_vexpect(src_dir, parse, vexpect)
+
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main())

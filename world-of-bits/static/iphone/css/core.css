@@ -1,0 +1,19 @@
+body {
+  background-color: #555;
+  font-family: Arial;
+  padding: 0;
+  margin: 0;
+  font-size: 14px;
+}
+
+.container {  
+  /* iphone 6 */
+  width:375px;
+  height:667px;
+  background-color: white;
+}
+
+.area {
+  width: 100%; /* fill parent */
+  height: 210px;
+}

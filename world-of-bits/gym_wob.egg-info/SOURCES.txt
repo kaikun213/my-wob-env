@@ -1,0 +1,5 @@
+gym_wob.egg-info/PKG-INFO
+gym_wob.egg-info/SOURCES.txt
+gym_wob.egg-info/dependency_links.txt
+gym_wob.egg-info/requires.txt
+gym_wob.egg-info/top_level.txt

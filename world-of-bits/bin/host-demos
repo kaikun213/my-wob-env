@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -eu
+if [ $# -ne 2 ]; then
+  echo "Usage bin/host-demos <env_id> <port>"
+  return 0
+fi
+
+env_id=$1
+port=$2
+
+demo_dest_dir="/tmp/world-of-bits-demo/$env_id/"
+mkdir -p $demo_dest_dir
+
+echo "======================================="
+echo "Running env_id=$env_id on port $port"
+echo "Writing demonstrations to $demo_dest_dir"
+echo "======================================="
+
+docker run \
+	-v $demo_dest_dir:/tmp/demo \
+	-p $port:5899 \
+	--cap-add NET_ADMIN --cap-add SYS_ADMIN -ti docker.openai.com/universe.world-of-bits:$(cat VERSION) \
+	demonstration ENV=$env_id

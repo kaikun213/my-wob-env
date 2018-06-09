@@ -1,0 +1,10 @@
+dill
+gym
+ipdb
+faketime
+jinja2
+manhole
+numpy
+redis
+selenium
+ujson

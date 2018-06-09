@@ -1,0 +1,37 @@
+#!/bin/bash
+
+display=0
+port=5900
+
+((port=port+PORT_OFFSET))
+((display=display+2*PORT_OFFSET)) # skip over xvfb
+
+(
+    export DISPLAY=":$display"
+    while ! xhost +; do
+	sleep 1
+    done
+) &
+
+if [ -e /tmp/.X${display}-lock ]; then
+    rm /tmp/.X${display}-lock
+fi
+
+if [ -e /tmp/.X11-unix/X${display} ]; then
+    rm /tmp/.X11-unix/X${display}
+fi
+
+mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
+
+exec sudo -u xvnc -H Xvnc ":$display" \
+     -br \
+     -depth 24 \
+     -DeferUpdate 5 \
+     -AlwaysShared \
+     -desktop "Xvnc4 ($(hostname))" \
+     -geometry 1024x768 \
+     -rfbauth /home/xvnc/.vnc/passwd \
+     -rfbport "$port" \
+     -fp /usr/share/fonts/X11/misc/,/usr/share/fonts/X11/Type1/,/usr/share/fonts/X11/75dpi/,/usr/share/fonts/X11/100dpi/ \
+     -co /etc/X11/rgb \
+     "$@"

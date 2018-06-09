@@ -1,0 +1,340 @@
+#!/usr/bin/env python
+import argparse
+import gym_demonstration
+import logging
+import os
+import re
+import shutil
+import sys
+
+from universe import spaces
+import gym_controlplane
+from gym_controlplane import error, integration
+
+logger = logging.getLogger()
+
+def capturable(event):
+    if isinstance(event, spaces.PointerEvent) and event.buttonmask != 0:
+        return True
+    if isinstance(event, spaces.KeyEvent) and event.down:
+        return True
+
+
+def generate_drag_transition(event, state_name, drag_from_x, drag_from_y, drag_from_buttonmask):
+    assert isinstance(event, spaces.PointerEvent)
+    return {
+        'callable': integration.DragTransition,
+        'src_state_name': state_name,
+        'kwargs': {
+            'x': event.x,
+            'y': event.y,
+            'buttonmask': event.buttonmask,
+            'drag_from_x': drag_from_x,
+            'drag_from_y': drag_from_y,
+            'drag_from_buttonmask': drag_from_buttonmask,
+        }
+    }
+
+def generate_transition(event, state_name, ready=False):
+    if isinstance(event, spaces.PointerEvent):
+        return {
+            'callable': integration.ClickTransition,
+            'ready': ready,
+            'src_state_name': state_name,
+            'kwargs': {
+                'x': event.x,
+                'y': event.y,
+                'buttonmask': event.buttonmask,
+            }
+        }
+    else:
+        return {
+            'callable': integration.KeyPressTransition,
+            'ready': ready,
+            'src_state_name': state_name,
+            'kwargs': {
+                'key': event.key
+            }
+        }
+
+class CompileVExpect(object):
+    def __init__(self, src_dir, build_dir, demo_path, gameover_only, merge=False):
+        self.src_dir = src_dir
+        self.build_dir = build_dir
+        self.writer = integration.VExpectWriter(self.src_dir, merge=merge)
+        self.demo_path = demo_path
+        self.gameover_only = gameover_only
+
+        # Arbitrary starting point
+        self.mouse_x = 100
+        self.mouse_y = 100
+
+        self.crop_mouse_x = None
+        self.crop_mouse_y = None
+
+        self._stateignore = self.load_stateignore()
+
+    def add_state(self, state_name, observation, stage, timestamp=None):
+        # Copy the image since the buffer will be mutated
+        image_name = '{}.png'.format(state_name)
+        self.writer.add_image(image_name, observation.copy())
+
+        width = 25
+        height = 25
+
+        if self.crop_mouse_x is None:
+            assert self.crop_mouse_y is None
+            x = self.mouse_x
+            y = self.mouse_y
+        else:
+            assert self.crop_mouse_y is not None
+            x = self.crop_mouse_x
+            y = self.crop_mouse_y
+            self.crop_mouse_x = None
+            self.crop_mouse_y = None
+
+        # Use the mouse as the bottom right so it's not in the
+        # image. For gameover, this is obviously best: who knows where
+        # the user will place the mouse).
+        #
+        # For initial, this is less obvious, and we'd started out by
+        # centering around the cursor. But it turns out that the
+        # cursor is very finicky, since its shape can change in a
+        # stateful fashion. So we select a patch that does not contain
+        # the cursor.
+        crop_coords = [x-width-1, width, y-height-1, height]
+        if stage == 'initial' or stage == None or stage == 'ready':
+            cooloff = 3
+        elif stage == 'gameover' or stage == 'ready':
+            crop_coords = [x-width-1, width, y-height-1, height]
+            cooloff = None
+        else:
+            raise error.Error('Invalid state type: {}'.format(state_name))
+
+        if stage == 'ready':
+            autoactive = 5
+        else:
+            autoactive = None
+        state = integration.ImageMatchState(src_dir=None, state_name=state_name, image_name=image_name, stage=stage, crop_coords=crop_coords, autoactive=autoactive, cooloff=cooloff)
+        self.writer.add_state(state, timestamp=timestamp)
+
+    def load_stateignore(self):
+        stateignore = set()
+        ignore = os.path.join(self.demo_path, 'stateignore')
+        if os.path.exists(ignore):
+            with open(ignore) as f:
+                for line in f:
+                    stateignore.add(line.strip())
+            logger.info('Running with stateignore loaded from %s: %s', ignore, stateignore)
+        return stateignore
+
+    def stateignore(self, state_name):
+        """Check if this state should be ignored. Usually for post-hoc
+        cleaning up a vexpect demo."""
+        return state_name in self._stateignore
+
+    def run(self):
+        if self.gameover_only:
+            state = 'gameover'
+        else:
+            state = 'resetting'
+
+        zero_code = spaces.KeyEvent.by_name('0').key
+        one_code = spaces.KeyEvent.by_name('1').key
+        backslash_code = spaces.KeyEvent.by_name('\\').key
+        transitions = []
+
+        has_initial = False
+        has_ready = False
+
+        initial_timestamp = None
+
+        last_observation = None
+        reader = gym_demonstration.VNCReader(self.demo_path)
+        potential_drag = False
+        for observation, reward, done, info, action in reader:
+            if last_observation is None: # just make sure we're initialized to *something*
+                last_observation = observation
+
+            if initial_timestamp is None:
+                print(info)
+                initial_timestamp = info['reader.frame_start_at']
+            else:
+                delta = info['reader.frame_start_at'] - initial_timestamp
+
+            for event in action:
+                if isinstance(event, spaces.PointerEvent):
+                    # Maintain the current pointer location
+                    self.mouse_x = event.x
+                    self.mouse_y = event.y
+
+                if isinstance(event, spaces.KeyEvent) and event.key == zero_code and event.down:
+                    # The demonstrator pressed backtick, indicating
+                    # the game is now begun!
+                    has_ready = True
+                    state = 'running'
+                    state_name = self.writer.next_state_name('ready')
+                    if self.stateignore(state_name):
+                        logger.info('Ignoring state: %s', state_name)
+                        continue
+
+                    self.add_state(state_name, observation, stage='ready', timestamp=delta)
+
+                    # Move the mouse out of the way
+                    transition = integration.ClickTransition(src=state_name, dsts=[], x=0, y=0, buttonmask=0)
+                    self.writer.add_transition(state_name, transition)
+                elif isinstance(event, spaces.KeyEvent) and event.key == one_code and event.down:
+                    # The demonstrator pressed 1, indicating the area
+                    # to screenshot for the next click.
+                    self.crop_mouse_x = self.mouse_x
+                    self.crop_mouse_y = self.mouse_y
+                elif isinstance(event, spaces.KeyEvent) and event.key == backslash_code and event.down:
+                    state_name = self.writer.next_state_name('gameover')
+                    if self.stateignore(state_name):
+                        logger.info('Ignoring state: %s', state_name)
+                        continue
+
+                    self.add_state(state_name, observation, stage='gameover', timestamp=delta)
+                elif state == 'resetting':
+                    if potential_drag and\
+                       isinstance(event, spaces.PointerEvent) and \
+                       transitions[-1]['kwargs']['buttonmask'] != 0 and\
+                       event.buttonmask == transitions[-1]['kwargs']['buttonmask']:
+                        # still dragging
+                        pass
+                    elif potential_drag and\
+                         isinstance(event, spaces.PointerEvent) and \
+                         event.buttonmask == 0 and\
+                         transitions[-1]['kwargs']['buttonmask'] != 0 and\
+                         (event.x != transitions[-1]['kwargs']['x'] or\
+                          event.y != transitions[-1]['kwargs']['y']):
+                        state_name = self.writer.next_state_name('initialize')
+
+                        # A drag just completed! This means: last
+                        # recorded action was a PointerEvent with
+                        # non-zero buttonmask, and this is a
+                        # PointerEvent with zero buttonmask at a
+                        # different location.
+                        transitions[-1]['kwargs']['is_drag'] = True
+                        x = transitions[-1]['kwargs']['x']
+                        y = transitions[-1]['kwargs']['y']
+                        buttonmask = transitions[-1]['kwargs']['buttonmask']
+                        self.add_state(state_name, last_observation, stage=stage, timestamp=delta)
+                        transition = generate_drag_transition(event, state_name, x, y, buttonmask)
+                        transitions.append(transition)
+                    elif capturable(event):
+                        if isinstance(event, spaces.PointerEvent):
+                            potential_drag = True
+                        else:
+                            potential_drag = False
+
+                        state_name = self.writer.next_state_name('initialize')
+                        if has_initial:
+                            stage = None
+                        else:
+                            has_initial = True
+                            stage = 'initial'
+                        # Get the frame before the click
+                        self.add_state(state_name, last_observation, stage=stage, timestamp=delta)
+                        transition = generate_transition(event, state_name)
+                        transitions.append(transition)
+                    else:
+                        potential_drag = False
+                if state == 'resetting':
+                    # Save the current screenshot
+                    last_observation = observation.copy()
+
+        if not has_ready and not self.gameover_only:
+            logger.warn('The demonstration did not indicate the ready state. To fix this, mouse to the bottom-right corner of a patch that distinguishes the ready state, and type 0.')
+
+        for i, transition in enumerate(transitions):
+            callable = transition['callable']
+            src_state_name = transition['src_state_name']
+
+            dsts = []
+            k = i+1
+            while k < len(self.writer.ordered_states):
+                dst = self.writer.ordered_states[k]
+                if dst.stage == 'gameover':
+                    # No transitioning to gameovers!
+                    break
+                elif dst.stage == 'ready':
+                    # We can transition to any ready stages
+                    dsts.append(dst.state_name)
+                else:
+                    # Just transition to the next initial stage
+                    dsts.append(dst.state_name)
+                    break
+                k += 1
+
+            kwargs = transition['kwargs']
+            transition = callable(src=src_state_name, dsts=dsts, **kwargs)
+            self.writer.add_transition(src_state_name, transition)
+        self.writer.metadata['source_demonstration'] = os.path.basename(os.path.normpath(self.demo_path))
+        self.writer.save()
+
+        # These actually are too large to bother saving
+        # if self.build_dir is not None:
+        #     integration.utils.clear_dir(self.build_dir)
+        #     shutil.copytree(self.demo_path, self.build_dir)
+
+        logger.info('The full source recording come from: %s , and has been copied to %s . You may want to make sure it has been uploaded to S3.', self.demo_path, self.build_dir)
+        logger.info('-----------------\n\nWrote out vexpect: %s', self.src_dir)
+
+def main():
+    parser = argparse.ArgumentParser(description=None)
+    parser.add_argument('-v', '--verbose', action='count', dest='verbosity', default=0, help='Set verbosity.')
+    parser.add_argument('-e', '--env-id', help='ID of the environment.')
+    parser.add_argument('-s', '--subdir', help='Generate as a subdirectory.')
+    parser.add_argument('-g', '--gameover-only', action='store_true', help='Assume game starts in the running state.')
+    parser.add_argument('-d', '--demo', help='Path to demonstration directory.')
+    parser.add_argument('-m', '--merge', action='store_true', help='Merge with an existing vexpect.')
+    args = parser.parse_args()
+
+    if args.verbosity == 0:
+        logger.setLevel(logging.INFO)
+    elif args.verbosity >= 1:
+        logger.setLevel(logging.DEBUG)
+
+    dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../flashgames/out/demo'))
+    if args.demo is not None:
+        demo = args.demo
+    else:
+        demos = [d for d in os.listdir(dir) if re.search('^\d+-', d)]
+        demo = os.path.join(dir, max(demos))
+        logger.info('Using most recent demo: %s', demo)
+
+    if args.env_id:
+        env_id = args.env_id
+    else:
+        env_id_path = os.path.join(dir, 'env_id.txt')
+        env_id = None
+        if os.path.exists(env_id_path):
+            with open(env_id_path) as f:
+                env_id = f.read().strip()
+        if not env_id:
+            parser.error('No -e provided, and {}/env_id.txt does not contain an env_id'.format(env_id_path))
+        logger.info('Using env_id of %s', env_id)
+
+    controlplane_spec = gym_controlplane.spec(id=env_id)
+    env_id = controlplane_spec.id
+
+    if env_id is not None:
+        # src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../src', env_id, 'vexpect'))
+        src_dir = controlplane_spec.vexpect_path
+        build_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../build/bulk', env_id, 'vexpect'))
+
+        if args.subdir:
+            src_dir = os.path.join(src_dir, args.subdir)
+            build_dir = os.path.join(build_dir, args.subdir)
+    else:
+        src_dir = None
+        build_dir = None
+
+    vexpect = CompileVExpect(src_dir, build_dir, demo, args.gameover_only, merge=args.merge)
+    vexpect.run()
+
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,244 @@
+#!/usr/bin/env python
+import argparse
+import json
+import logging
+import numpy as np
+import os
+import six
+import sys
+import threading
+import time
+import traceback
+import cv2
+import yaml
+import json
+
+if sys.platform == 'darwin':
+    # the MacOSX backend doesn't handle keypress events nicely, so we use TKAgg
+    # instead. See http://stackoverflow.com/questions/32129630/key-press-event-not-registered-properly-by-matplotlib
+    import matplotlib
+    matplotlib.use('TKAgg')
+from matplotlib import pyplot as plt
+
+import gym
+from universe import envs, spaces, wrappers
+import gym_controlplane
+from gym_controlplane import error, integration
+
+gym_controlplane.logger_setup('play_vexpect')
+logger = logging.getLogger()
+
+def load_img(path):
+    return cv2.cvtColor(cv2.imread(path), cv2.COLOR_BGR2RGB)
+
+def crop(img, coords):
+    if coords is not None:
+        x, length, y, height = coords
+        img = img[y:y+height, x:x+length]
+    return img
+
+class UserInput(threading.Thread):
+    daemon = True
+
+    def __init__(self, vexpect):
+       super(UserInput, self).__init__()
+       self.vexpect = vexpect
+
+    def run(self):
+        try:
+            self.do_run()
+        except Exception as e:
+            logger.error('Caught error in UserInput thread: %s', e)
+
+    def do_run(self):
+        self.start_time = time.time()
+
+        while True:
+            try:
+                if six.PY2:
+                    global input
+                    input = raw_input
+                input_command = input("""[UserInput] Input commands:
+  d [debug show]
+  i [ipdb session]
+  c [show score crop]
+""").strip()
+            except EOFError:
+                # True when stdin isn't open
+                return
+            split = input_command.split(' ')
+            command, args = split[0], split[1:]
+
+            try:
+                if command == 'i':
+                    self.vexpect.flag_ipdb()
+                elif command == 'd':
+                    self.vexpect.flag_debug_show()
+                elif command == 'c':
+                    self.vexpect.flag_show_score_crop()
+            except Exception as e:
+                if six.PY2:
+                    logger.error('[UserInput] Error processing command: %s', traceback.format_exc(e))
+                else:
+                    logger.error('[UserInput] Error processing command: %s', '\n'.join(traceback.format_exception(type(e), e, e.__traceback__)))
+
+    def trigger_ipdb(self):
+        self.vexpect._trigger_ipdb()
+
+def main():
+    parser = argparse.ArgumentParser(description=None)
+    parser.add_argument('-w', '--wait', default=15, type=int, help='wait this long before screenshot.')
+    parser.add_argument('-v', '--verbose', action='count', dest='verbosity', default=0, help='Set verbosity.')
+    parser.add_argument('-r', '--remotes', default='vnc://localhost:5900+15900', help='Which VNC address to connect to.')
+    parser.add_argument('-d', '--non-interactive', action='store_true', help='Do not run the userinput thread.')
+    parser.add_argument('-g', '--gameover', action='store_true', help='Wait for gameover.')
+    parser.add_argument('-s', '--screenshot', action='store_true', help='Just take screenshot.')
+    parser.add_argument('-m', '--monitor', action='store_true', help='Monitor the state.')
+    parser.add_argument('-i', '--initial-states', help='Initial states.')
+    parser.add_argument('-e', '--env-id', help='ID of the environment.')
+    parser.add_argument('-R', '--reset', action='store_true', help='Just reset the env.')
+    parser.add_argument('-V', '--vexpect', action='store_false', help='whether to use vexpect or not')
+    args = parser.parse_args()
+
+    if args.verbosity == 0:
+        logger.setLevel(logging.INFO)
+    elif args.verbosity >= 1:
+        logger.setLevel(logging.DEBUG)
+
+    if args.env_id:
+        env_id = args.env_id
+    else:
+        # parser.error('You must provide "-e ENV_ID"')
+        dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../out/demo'))
+        env_id_path = os.path.join(dir, 'env_id.txt')
+        env_id = None
+        if os.path.exists(env_id_path):
+            with open(env_id_path) as f:
+                env_id = f.read()
+        if not env_id:
+            parser.error('No -e provided, and {}/env_id.txt does not contain an env_id'.format(env_id_path))
+        logger.info('Using env_id of %s', env_id)
+
+    if args.reset:
+        print('='*40)
+        print('RESETING')
+        print('='*40)
+        env = gym.make(env_id)
+        env.configure(remotes=args.remotes, observer=True)
+        env.reset()
+        return 0
+
+    controlplane_spec = gym_controlplane.spec(id=env_id)
+
+    src_dir = controlplane_spec.vexpect_path
+    config_path = controlplane_spec.config_path
+    ocr_dir = os.path.abspath(os.path.join(os.path.dirname(config_path), 'ocr'))
+    screenshot_dir = os.path.abspath(os.path.join(ocr_dir, 'screenshots'))
+    if not os.path.exists(ocr_dir):
+        os.makedirs(ocr_dir)
+    if not os.path.exists(screenshot_dir):
+        os.makedirs(screenshot_dir)
+
+    env = wrappers.Unvectorize(envs.VNCEnv())
+    if not args.gameover:
+        remotes = args.remotes.split('+')[0]
+    else:
+        remotes = args.remotes
+    env.configure(remotes=remotes, ignore_clock_skew=True, observer=True)
+
+    # Hack to block until reset completes
+    screen = None
+    while screen is None:
+        screen, _, _, _ = env.step([])
+
+    if not args.vexpect:
+        logger.info('not using vexpect')
+    else:
+        start = time.time()
+        vexpect = integration.VExpect.load(src_dir)
+        if args.initial_states: initial_states = args.initial_states.split(',')
+        else: initial_states = None
+        try:
+            vexpect.run_initialize(env, initial_states=initial_states)
+        except error.VExpectTimeout as e:
+            logger.error('Handled error.VExpectTimeout: %s (runtime: %fs)', e, time.time() - start)
+            return 10
+        logger.info('vexpect macro complete in %fs', time.time() - start)
+
+    global coords, history
+    coords = [0, 0, 0, 0]
+    history = []
+    def onkey(event):
+        print('key', event.key)
+        if event.key == 'b':
+            if len(history) > 0:
+                logger.info('[key event] reverting crop history')
+                del history[-1]
+            else:
+                logger.info('[key event] no history remaining')
+            draw()
+        elif event.key == 'g':
+            sx, ex, sy, ey = history[-1]
+            x = sx
+            y = sy
+            width = ex-sx
+            height = ey-sy
+            config = {}
+            if os.path.exists(config_path):
+                logger.info('config already exists - overwritting scorer section')
+                config = yaml.load(open(config_path))
+                print('CONFIG:')
+                print(config)
+            logger.info('[key event] writing config.yml to %s'%config_path)
+            config['scorer'] = {
+                'type':'OCRScorerV0',
+                'model_path':'models/v1/params.jl',
+                'crop_coords':[x, width, y, height],
+                'prob_threshold':0.95,
+                'median_filter_size':5,
+            }
+            with open(config_path, 'w') as f:
+                f.write(yaml.dump(config))
+
+    def draw():
+        global history
+        sx, ex, sy, ey = history[-1]
+        plt.imshow(screen[sy:ey, sx:ex], interpolation='nearest')
+        fig.canvas.draw()
+
+    def onpress(event):
+        global coords
+        coords[0] = int(round(event.xdata))
+        coords[2] = int(round(event.ydata))
+    def onrelease(event):
+        global coords, history
+        coords[1] = int(round(event.xdata))
+        coords[3] = int(round(event.ydata))
+        sx, ex, sy, ey = coords
+        if sx > ex:
+            sx, ex = ex, sx
+        if sy > ey:
+            sy, ey = ey, sy
+        if len(history) > 0:
+            sx = sx + history[-1][0]
+            ex = ex + history[-1][0] + 1
+            sy = sy + history[-1][2]
+            ey = ey + history[-1][2] + 1
+            coords = [sx, ex, sy, ey]
+        history.append([sx, ex, sy, ey])
+        draw()
+
+    time.sleep(args.wait)
+    fig = plt.figure()
+    screen, _, _, _ = env.step([])
+    screen = screen['vision']
+    plt.imshow(screen, interpolation='nearest')
+    cid0 = fig.canvas.mpl_connect('button_press_event', onpress)
+    cid1 = fig.canvas.mpl_connect('button_release_event', onrelease)
+    cid2 = fig.canvas.mpl_connect('key_press_event', onkey)
+    plt.show()
+    print("done")
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main())

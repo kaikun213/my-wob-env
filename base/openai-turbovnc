@@ -1,0 +1,36 @@
+#!/bin/bash
+
+display=0
+port=5900
+
+((port=port+PORT_OFFSET))
+((display=display+2*PORT_OFFSET)) # skip over xvfb
+
+(
+    export DISPLAY=":$display"
+    while ! xhost +; do
+	sleep 1
+    done
+) &
+
+if [ -e /tmp/.X${display}-lock ]; then
+    rm /tmp/.X${display}-lock
+fi
+
+if [ -e /tmp/.X11-unix/X${display} ]; then
+    rm /tmp/.X11-unix/X${display}
+fi
+
+mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
+
+exec sudo -u xvnc -H TVNC_MT=${TVNC_MT} TVNC_NTHREADS=${TVNC_NTHREADS} /opt/TurboVNC/bin/Xvnc ":$display" \
+     -securitytypes vnc \
+     -br \
+     -depth 24 \
+     -deferupdate 5 \
+     -alwaysshared \
+     -desktop "TurboVNC ($(hostname))" \
+     -geometry 1024x768 \
+     -rfbauth /home/xvnc/.vnc/passwd \
+     -rfbport "$port" \
+     "$@"

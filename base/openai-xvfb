@@ -1,0 +1,19 @@
+#!/bin/bash
+
+set -x
+
+display=1
+((display=display+2*PORT_OFFSET)) # skip over xvnc4
+
+if [ -e /tmp/.X${display}-lock ]; then
+    rm /tmp/.X${display}-lock
+fi
+
+if [ -e /tmp/.X11-unix/X${display} ]; then
+    rm /tmp/.X11-unix/X${display}
+fi
+
+# Make sure this is owned by root
+mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
+
+exec sudo -u xvfb Xvfb -screen 0 1024x768x24 +extension RANDR ":$display"

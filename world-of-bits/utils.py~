@@ -1,0 +1,37 @@
+import logging
+import time
+logger = logging.getLogger(__name__)
+class PeriodicLog(object):
+    def log(self, obj, name, msg, *args, **kwargs):
+        try:
+            info = obj._periodic_log_info
+        except AttributeError:
+            info = obj._periodic_log_info = {}
+
+        # Would be better to use a frequency=... arg after kwargs, but
+        # that isn't py2 compatible.
+        frequency = kwargs.pop('frequency', 1)
+        delay = kwargs.pop('delay', 0)
+        last_log = info.setdefault(name, time.time()-frequency+delay)
+        if time.time() - last_log < frequency:
+            return
+        info[name] = time.time()
+        logger.info('[{}] {}'.format(name, msg), *args)
+
+    def log_debug(self, obj, name, msg, *args, **kwargs):
+        try:
+            info = obj._periodic_log_debug
+        except AttributeError:
+            info = obj._periodic_log_debug = {}
+
+        frequency = kwargs.pop('frequency', 1)
+        delay = kwargs.pop('delay', 0)
+        last_log = info.setdefault(name, time.time()-frequency+delay)
+        if time.time() - last_log < frequency:
+            return
+        info[name] = time.time()
+        logger.debug('[{}] {}'.format(name, msg), *args)
+
+_periodic = PeriodicLog()
+periodic_log = _periodic.log
+periodic_log_debug = _periodic.log_debug

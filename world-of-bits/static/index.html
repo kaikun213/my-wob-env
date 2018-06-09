@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html>
+<head>
+
+<title>World of Bits index</title>
+<style>
+#errors { display: none; }
+.miniwob { display: block; }
+a { display: inline-block; }
+</style>
+
+<script src="core/miniwobs.js"></script>
+<script>
+var LIST_TEMPLATE =
+`
+<a href=""></a><span></span>
+`
+
+window.onload = function() {
+  document.getElementById('msg').innerHTML = 'total ' + miniwobs.envs.length + ' environments.';
+
+  // generate links using the JSON data in miniwobs.js
+  for(var i=0;i<miniwobs.envs.length;i++){
+    var wobEnv = miniwobs.envs[i];
+
+    var div = document.createElement('div');
+    div.innerHTML = LIST_TEMPLATE;
+    div.setAttribute('class', 'miniwob')
+
+    div.getElementsByTagName('a')[0].innerHTML = wobEnv.filename;
+    div.getElementsByTagName('a')[0].setAttribute('href', 'miniwob/' + wobEnv.filename + '.html');
+    div.getElementsByTagName('span')[0].innerHTML = ': ' + wobEnv.description;
+
+    var tag = wobEnv.tags.length > 0 ? wobEnv.tags[0] : 'other';
+
+    document.getElementById(tag + '-envs').append(div);
+  }
+
+  // display errors to validate miniwobs.js JSON data.
+  miniwobs.checkErrors(miniwobs);
+}
+</script>
+
+</head>
+<body>
+  <h1>World of Bits index</h1>
+  <div id="msg"></div>
+  <div id="errors">
+    <h3>Errors</h3>
+    <p>The following errors were found in miniwobs.js:</p>
+  </div>
+  <hr>
+
+  <div id="click-envs">
+    <h2>Click Tasks</h2>
+    <p>Tasks achievable by a policy that only clicks. That is, the action space is a 2D continuous space of the x and y coordinate and it is assumed that at every time step after moving to a new x,y position the agent also immidiately left clicks.</p>
+  </div>
+
+  <div id="drag-envs">
+    <h2>Drag Tasks</h2>
+    <p>Tasks achievable by a policy that has action space consisting of 1) a 2D continuous space giving the x,y coordinate as in click tasks, but also 2) a binary variable indicating whether the mouse button is currently pressed. E.g. this policy can also drag (by moving x,y and keeping the button pressed) and hover (by moving x,y while keeping button released), and is not restricted to clicking after every time step.</p>
+  </div>
+
+  <div id="mouse-envs">
+    <h2>Mouse Tasks</h2>
+    <p>Tasks achievable by a policy that has action space of 1) a 2D continuous space giving the x,y coordinate and 2) 8 binary variables that indicate whether any of 8 possibly mouse buttons is pressed. The most common ones of these are [scroll up] and [scroll down] actions. The other ones can be ignored in current tasks.</p>
+  </div>
+
+  <div id="other-envs">
+    <h2>Other Tasks</h2>
+    <p>These tasks require both the mouse and also the full keyboard.</p>
+  </div>
+</body>
+</html>

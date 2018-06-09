@@ -1,0 +1,32 @@
+#!/bin/bash
+
+set -eu
+
+url=$OPENAI_LIVESTREAM_URL
+echo "Beginning livestream to $url"
+
+sudo -H -u xvnc pulseaudio -D || :
+
+while true; do
+    sudo -H -u xvnc DISPLAY=$DISPLAY avconv \
+	 -f x11grab \
+	 -video_size 1024x768 \
+	 -r 10 \
+	 -i :0.0 \
+	 -f pulse \
+	 -i default \
+	 -c:v libx264 \
+	 -x264opts keyint=2:min-keyint=2:scenecut=-1 \
+	 -vf scale=512:384 \
+	 -profile:v baseline \
+	 -pix_fmt yuv420p \
+	 -b:v 20m \
+	 -c:a libmp3lame \
+	 -b:a 128k \
+	 -ar 44100 \
+	 -f flv \
+	 "$url" || (
+	echo 2>&1 "avconv crashed. Going to respawn in 10s..."
+	sleep 10
+    )
+done

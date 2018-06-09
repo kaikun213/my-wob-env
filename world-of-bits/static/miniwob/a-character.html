@@ -1,0 +1,120 @@
+<html lang="en">
+<head>
+  <title>Character Challenge</title>
+  <!-- stylesheets -->
+  <link rel="stylesheet" type="text/css" href="../core/core.css">
+  <!-- JS -->
+  <script src="../core/core.js"></script>
+  <script src="../core/character_solutions.js"></script>
+  <style>
+    div#area {
+      position: relative;
+    }
+
+    div.train {
+      width: 100%;
+      height: calc(100% - 80px);
+
+      position: absolute;
+      bottom: 0;
+      left: 0;
+    }
+    img {
+      width: 78px;
+      height: 78px;
+    }
+    IMG.displayed { /* center image */
+    display: block;
+    margin-left: auto;
+    margin-right: auto }
+  </style>
+  <script>
+    let state = {
+      folder: 01,
+      testImg_index: 01,
+    }
+    let testImg = null, trainDiv = null
+
+    genProblem = function () {
+      state.folder = 1; //core.randi(1,20);
+      // one of the the two images - easy
+      state.testImg_index = core.randi(1,3);
+      trainDiv = document.querySelector('.train');
+      testDiv = document.querySelector('.test');
+
+      LoadTrainingImages(); // loads the training
+      LoadTestImage();
+    }
+
+    function fixNum (num) {
+      return num < 10 ? '0'+num : num
+    }
+
+    function createImg(row, centered, path, index) {
+     let img = document.createElement('img')
+     img.src = path
+     img['data-index'] = index
+     img.onclick = clickTrain
+     if (centered) { // filler
+      img.className = 'displayed'
+     }
+     row.appendChild(img)
+    }
+
+    function LoadTrainingImages () {
+      trainDiv.innerHTML = ''
+
+      let folder = fixNum(state.folder)
+      let current = 0
+      let row = document.createElement('div')
+      row.className = 'row'
+
+      for (let c=1; c<3; c++) {
+        let img = document.createElement('img')
+        current = state.testImg_index == c ? testToTrainID(state.testImg_index) : fixNum(c)
+        console.log(folder, current)
+        createImg(row, false, `../img/all_runs/run${folder}/training/class${current}.png`, fixNum(c));
+      trainDiv.appendChild(row)
+      }
+    }
+
+    function testToTrainID(id) {
+     return solutions_object[state.folder-1][fixNum(id)];
+    }
+
+    function LoadTestImage () {
+     console.log('testImage', state.folder, fixNum(state.testImg_index))
+     testDiv.innerHTML = '';
+     let row = document.createElement('div');
+     row.className = 'row';
+     createImg(row, true,`../img/all_runs/run${fixNum(state.folder)}/test/item${fixNum(state.testImg_index)}.png`, 0);
+     testDiv.appendChild(row)
+    }
+    function clickTrain () {
+      // Correct image clicked according to solutions-array
+      // score = solutions_object[state.folder-1][fixNum(state.testImg_index)] == this['data-index'] ? 1 : -1;
+
+      // easy version -> look at test == training index
+      score = state.testImg_index == this['data-index'] ? 1 : -1;
+
+      console.log('It should be ' + solutions_object[state.folder-1][fixNum(state.testImg_index)] + ' and was ' + this['data-index']);
+      // Make reward time proportional
+      core.endEpisode(score, true);
+    }
+
+    window.onload = function() {
+      genProblem(); // start things off on load immediately
+      core.startEpisode();
+    }
+  </script>
+</head>
+<body>
+  <div id="wrap">
+    <div id="query"> Character Challenge: Click the img in the bottom line that is similar to the upper test one</div>
+    <div id="area">
+      <div class="test"> <img  src="" alt="test image"> </div>
+      <div class='train'></div>
+    </div>
+  </div>
+</body>
+</html>

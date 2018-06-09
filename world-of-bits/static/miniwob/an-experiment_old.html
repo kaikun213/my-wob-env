@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Select Character Train</title>
+<!-- stylesheets -->
+<link rel="stylesheet" type="text/css" href="../core/core.css">
+<!-- JS -->
+<script src="../core/core.js"></script>
+<script src="../core/d3.v3.min.js"></script>
+
+<style>
+#subbtn { width: 40px; height: 40px; }
+#subbtn2 { width: 40px; height: 40px; }
+</style>
+
+<script>
+var winner_img;
+var training_set;
+var run_nr;
+
+var imgClicked = function(id){
+
+}
+
+var genProblem = function() {
+  run_nr =  Math.floor((Math.random() * 20) + 1);
+  
+}
+
+window.onload = function() {
+  genProblem(); // start things off on load immediately
+  core.startEpisode();
+}
+</script>
+</head>
+<body>
+<div id="wrap">
+  <div id="query">Select the similar character. (Oneshot)</div>
+  <div id="area">
+    <div class="row">
+     <div class="column">
+       <img id=1 src="../img/class01.png" alt="Example 1" onClick="imgClicked(this.id)">
+     </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
